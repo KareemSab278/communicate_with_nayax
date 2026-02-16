@@ -4,48 +4,59 @@ import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
 function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
-
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
-
+  const [command, setCommand] = useState("");
+  const [portName, setPortName] = useState("");
+  const [addr, setAddr] = useState(0);
+  const [output, setOutput] = useState("");
   return (
     <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
+      <h1>Run a command to the nayax reader here</h1>
 
       <form
         className="row"
-        onSubmit={(e) => {
+        onSubmit={async (e) => {
           e.preventDefault();
-          greet();
+          const output = await invoke_cmd(command, portName, addr);
+          setOutput(output);
         }}
       >
         <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
+          id="command-input"
+          onChange={(e) => setCommand(e.currentTarget.value)}
+          placeholder="Enter a command..."
         />
-        <button type="submit">Greet</button>
+        <input
+          id="port-input"
+          onChange={(e) => setPortName(e.currentTarget.value)}
+          placeholder="Enter a port name..."
+        />
+        <input
+          id="addr-input"
+          type="number"
+          onChange={(e) => setAddr(Number(e.currentTarget.value))}
+          placeholder="Enter an address..."
+        />
+        <button type="submit">Run Command</button>
       </form>
-      <p>{greetMsg}</p>
+      <p>{output}</p>
     </main>
   );
 }
 
 export default App;
+
+
+const invoke_cmd = async (command, portName, addr) => {
+    try {
+        const commandResponse = invoke("run_cmd", {
+            command: command,
+            port_name: portName,
+            addr: addr,
+        });
+        console.log("Command response:", commandResponse);
+        return commandResponse;
+    } catch (error) {
+        console.error("Error running command:", error);
+        return "Error running command";
+    }
+};
