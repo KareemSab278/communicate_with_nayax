@@ -1,113 +1,107 @@
 use serialport::{DataBits, FlowControl, Parity, StopBits};
-use std::io::{Read, Write};
-use std::thread::sleep;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::time::Duration;
 
-// Example: number of retries and command delay
-const RESET_RETRIES: u8 = 3;
-const CASHLESS_CMD_DELAY_MS: u64 = 8000;
-const BAUD_RATE: u64 = 115200;
+// ── Serial settings per MDB Master RS232 docs ──
+// Baud: 115200, Data: 8, Parity: NONE, Stop: 1, HW flow: RTS/CTS, SW flow: NO
+const BAUD_RATE: u32 = 115200;
+const DAEMON_ADDR: &str = "127.0.0.1:5127";
+const TCP_TIMEOUT_MS: u64 = 1000;
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+// ─────────────────────────────────────────────────────────────
+//  HIGH LEVEL MODE — talks to the Python daemon via TCP :5127
+//  Send text commands like CashlessReset(1), get JSON back.
+// ─────────────────────────────────────────────────────────────
+
+/// Send a text command to the MDB daemon on TCP 5127 and return the JSON response.
 #[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+fn mdb_command(command: String) -> Result<String, String> {
+    println!("[TCP] Connecting to daemon at {}", DAEMON_ADDR);
 
-#[tauri::command]
-fn cashless_reset(addr: u8, port_name: &str) -> Result<bool, String> {
-    // this needs the correct port settings for the nayax reader
-    let mut port = serialport::new(port_name, BAUD_RATE.try_into().unwrap())
-        .data_bits(DataBits::Eight)
-        .parity(Parity::Even)
-        .stop_bits(StopBits::One)
-        .flow_control(FlowControl::Hardware)
-        .timeout(Duration::from_millis(400))
-        .open()
-        .map_err(|e| format!("Failed to open port: {}", e))?;
+    let stream = TcpStream::connect(DAEMON_ADDR)
+        .map_err(|e| format!("Cannot connect to MDB daemon at {} — is the Python daemon running? Error: {}", DAEMON_ADDR, e))?;
 
-    let reset_cmd: u8 = (addr & 0xF0) | 0x00;
-    println!(
-        "[TX] Sending RESET to addr 0x{:02X} -> 0x{:02X}",
-        addr, reset_cmd
-    );
+    stream
+        .set_read_timeout(Some(Duration::from_millis(TCP_TIMEOUT_MS)))
+        .map_err(|e| format!("Set timeout failed: {}", e))?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(TCP_TIMEOUT_MS)))
+        .map_err(|e| format!("Set timeout failed: {}", e))?;
 
-    let mut buf = [0u8; 1];
+    let mut writer = stream.try_clone().map_err(|e| format!("Clone failed: {}", e))?;
 
-    for attempt in 1..=RESET_RETRIES {
-        port.write(&[reset_cmd])
-            .map_err(|e| format!("Write failed: {}", e))?;
-        port.flush().unwrap_or_default();
+    let msg = format!("{}\n", command.trim());
+    println!("[TCP TX] {}", msg.trim());
+    writer
+        .write_all(msg.as_bytes())
+        .map_err(|e| format!("Write failed: {}", e))?;
+    writer.flush().map_err(|e| format!("Flush failed: {}", e))?;
 
-        println!("[RESET] Attempt {}/{}", attempt, RESET_RETRIES);
+    // Read response line(s) — daemon returns JSON
+    let mut reader = BufReader::new(&stream);
+    let mut response = String::new();
 
-        match port.read(&mut buf) {
-            Ok(1) if buf[0] == 0x00 => {
-                println!("[RESET] ACK received");
-                return Ok(true);
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    println!("[TCP RX] {}", trimmed);
+                    if !response.is_empty() {
+                        response.push('\n');
+                    }
+                    response.push_str(trimmed);
+                }
             }
-            Ok(n) => {
-                println!("[RX] Received {} byte(s): {:02X?}", n, &buf[..n]);
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break; // done reading
             }
             Err(e) => {
-                println!("[RX] No response: {}", e);
+                if response.is_empty() {
+                    return Err(format!("Read failed: {}", e));
+                }
+                break;
             }
         }
-
-        sleep(Duration::from_millis(200));
     }
 
-    println!("[RESET] No ACK after {} attempts", RESET_RETRIES);
-    Ok(false)
+    if response.is_empty() {
+        return Err("No response from MDB daemon (timeout)".into());
+    }
+
+    Ok(response)
 }
 
-#[tauri::command]
-fn run_cmd(command: &str, port_name: &str, addr: u8) -> Result<String, String> {
-    let mut port = serialport::new(port_name, BAUD_RATE.try_into().unwrap())
+// ─────────────────────────────────────────────────────────────
+//  LOW LEVEL MODE — direct serial, proper MDB binary framing
+//  Settings: 115200 8N1, RTS/CTS hardware flow, no SW flow
+// ─────────────────────────────────────────────────────────────
+
+/// Open the serial port with the correct MDB Master RS232 settings.
+fn open_serial(port_name: &str, timeout_ms: u64) -> Result<Box<dyn serialport::SerialPort>, String> {
+    serialport::new(port_name, BAUD_RATE)
         .data_bits(DataBits::Eight)
-        .parity(Parity::Even)
+        .parity(Parity::None)          // MDB RS232 doc says NONE
         .stop_bits(StopBits::One)
-        .flow_control(FlowControl::Hardware) // To enable RTS/CTS and disable XON/XOFF use:
-        .timeout(Duration::from_millis(200))
+        .flow_control(FlowControl::Hardware) // RTS/CTS per doc
+        .timeout(Duration::from_millis(timeout_ms))
         .open()
-        .map_err(|e| format!("Failed to open port: {}", e))?;
-
-    let cmd: u8 = (addr &0xF0) | 0x10;
-    println!("[TX] Sending Command to addr 0x{:02X} -> 0x{:02X}", addr, cmd);
-    let mut buf = [0u8; 1];
-
-    for attempt in 1..=RESET_RETRIES {
-        port.write(&[cmd])
-            .map_err(|e| format!("Write failed: {}", e))?;
-        port.flush().ok();
-
-        println!("[CMD] Attempt {}/{}", attempt, RESET_RETRIES);
-
-        match port.read(&mut buf) {
-            Ok(1) if buf[0] == 0x00 => {
-                println!("[CMD] ACK received");
-                return Ok("ACK received".to_string());
-            }
-            Ok(n) => println!("[RX] Received {} byte(s): {:02X?}", n, &buf[..n]),
-            Err(e) => println!("[RX] No response: {}", e),
-        }
-
-        sleep(Duration::from_millis(200));
-    }
-
-    println!("[CMD] No ACK after {} attempts", RESET_RETRIES);
-    Ok("No ACK received".to_string())
+        .map_err(|e| format!("Failed to open port {}: {}", port_name, e))
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet, cashless_reset, run_cmd, send_raw])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+/// Calculate MDB checksum (simple sum of all bytes, lowest 8 bits).
+fn mdb_checksum(data: &[u8]) -> u8 {
+    let sum: u16 = data.iter().map(|&b| b as u16).sum();
+    (sum & 0xFF) as u8
 }
 
+/// Send raw MDB binary frame (with auto-CRC) over serial in low-level mode.
+/// The CRC byte is appended automatically.
 #[tauri::command]
 fn send_raw(
     port_name: &str,
@@ -115,17 +109,66 @@ fn send_raw(
     read_timeout_ms: Option<u64>,
     expected_len: Option<usize>,
 ) -> Result<Vec<u8>, String> {
-    let timeout = Duration::from_millis(read_timeout_ms.unwrap_or(200));
-    let mut port = serialport::new(port_name, BAUD_RATE.try_into().unwrap())
-        .data_bits(DataBits::Eight)
-        .parity(Parity::Even)
-        .stop_bits(StopBits::One)
-        .flow_control(FlowControl::Software)
-        .timeout(timeout)
-        .open()
-        .map_err(|e| format!("open error: {}", e))?;
+    let timeout = read_timeout_ms.unwrap_or(200);
+    let mut port = open_serial(port_name, timeout)?;
 
-    port.write_all(&data).map_err(|e| format!("write error: {}", e))?;
+    // Append MDB checksum
+    let chk = mdb_checksum(&data);
+    let mut frame = data.clone();
+    frame.push(chk);
+
+    println!(
+        "[SERIAL TX] {} bytes (inc CRC): {:02X?}",
+        frame.len(),
+        frame
+    );
+
+    port.write_all(&frame)
+        .map_err(|e| format!("Write failed: {}", e))?;
+    port.flush().ok();
+
+    // Read response
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 256];
+
+    loop {
+        match port.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                resp.extend_from_slice(&buf[..n]);
+                if let Some(exp) = expected_len {
+                    if resp.len() >= exp {
+                        break;
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+            Ok(_) => break,
+            Err(e) => return Err(format!("Read error: {}", e)),
+        }
+    }
+
+    println!("[SERIAL RX] {} bytes: {:02X?}", resp.len(), resp);
+    Ok(resp)
+}
+
+#[tauri::command]
+fn send_raw_with_crc(
+    port_name: &str,
+    data: Vec<u8>,
+    read_timeout_ms: Option<u64>,
+    expected_len: Option<usize>,
+) -> Result<Vec<u8>, String> {
+    let timeout = read_timeout_ms.unwrap_or(200);
+    let mut port = open_serial(port_name, timeout)?;
+
+    println!(
+        "[SERIAL TX RAW] {} bytes: {:02X?}",
+        data.len(),
+        data
+    );
+
+    port.write_all(&data)
+        .map_err(|e| format!("Write failed: {}", e))?;
     port.flush().ok();
 
     let mut resp = Vec::new();
@@ -136,15 +179,32 @@ fn send_raw(
             Ok(n) if n > 0 => {
                 resp.extend_from_slice(&buf[..n]);
                 if let Some(exp) = expected_len {
-                    if resp.len() >= exp { break; }
+                    if resp.len() >= exp {
+                        break;
+                    }
                 }
-                // keep reading until timeout or expected_len
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => break,
             Ok(_) => break,
-            Err(e) => return Err(format!("read error: {}", e)),
+            Err(e) => return Err(format!("Read error: {}", e)),
         }
     }
 
+    println!("[SERIAL RX] {} bytes: {:02X?}", resp.len(), resp);
     Ok(resp)
+}
+
+// ─────────────────────────────────────────────────────────────
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![
+            mdb_command,
+            send_raw,
+            send_raw_with_crc,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 }
